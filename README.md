@@ -77,7 +77,7 @@ Team-Productivity/
 2. Create and activate a Python virtual environment:
    ```powershell
    python -m venv venv
-   .\venv\Scripts\Activate.ps1
+   .\venv\Scripts\Activate.ps1 or venv\Scripts\activate
    ```
 3. Install dependencies:
    ```powershell
@@ -134,7 +134,7 @@ Team-Productivity/
    The frontend automatically connects to the backend on `http://127.0.0.1:8000/api`.
 4. Start the Angular development server:
    ```powershell
-   npm start
+   ng serve
    ```
 5. Open your browser and navigate to:
    **[http://localhost:4200](http://localhost:4200)**
