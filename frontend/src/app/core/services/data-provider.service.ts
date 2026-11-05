@@ -1,4 +1,5 @@
 import { Injectable, signal, computed, inject } from '@angular/core';
+import { Observable, of, tap } from 'rxjs';
 import { HttpClient } from '@angular/common/http';
 import { Employee, TimesheetEntry, FilterState, RoleType, ControlledItem, API_BASE_URL } from '../models/models';
 import { CalculationService, NO_AI } from './calculation.service';
@@ -294,18 +295,13 @@ export class DataProviderService {
     });
   }
 
-  deleteControlledField(category: string, value: string): void {
+  deleteControlledField(category: string, value: string): Observable<any> {
     const val = value.trim();
-    if (!val) return;
+    if (!val) return of(null);
 
-    const filterer = (items: ControlledItem[]) => items.filter(x => x.name.toLowerCase() !== val.toLowerCase());
-    if (category === 'taskTypes') this.taskTypeItems.update(filterer);
-    else if (category === 'priorities') this.priorityItems.update(filterer);
-    else if (category === 'statuses') this.statusItems.update(filterer);
-    else if (category === 'aiTools') this.aiToolItems.update(filterer);
-
-    this.http.post<any>(`${API_BASE_URL}/reference/config/delete`, { category, value: val }).subscribe({
-      next: (res) => {
+    // Only update view once confirmed deleted in database
+    return this.http.post<any>(`${API_BASE_URL}/reference/config/delete`, { category, value: val }).pipe(
+      tap((res) => {
         if (res && res.success && res.values) {
           const normalized = this.normalizeControlledList(res.values);
           if (category === 'taskTypes') this.taskTypeItems.set(normalized);
@@ -313,9 +309,8 @@ export class DataProviderService {
           else if (category === 'statuses') this.statusItems.set(normalized);
           else if (category === 'aiTools') this.aiToolItems.set(normalized.filter(i => i.name !== 'None (Manual)' && i.name !== NO_AI && i.name !== 'N/A'));
         }
-      },
-      error: (err) => console.warn('Failed to delete controlled field:', err)
-    });
+      })
+    );
   }
 
   importEntries(newEntries: TimesheetEntry[]): void {
@@ -605,48 +600,28 @@ export class DataProviderService {
     return count;
   }
 
-  addEmployee(data: { name: string; email: string; team: string; designation: string; password?: string }): Employee {
-    const currentEmployees = this.state().employees;
-    const nums = currentEmployees
-      .map(e => parseInt(e.id.replace(/\D/g, ''), 10))
-      .filter(n => !isNaN(n));
-    const nextNum = nums.length > 0 ? Math.max(...nums) + 1 : currentEmployees.length + 1;
-    const newId = 'E' + (nextNum < 10 ? '0' + nextNum : nextNum);
-
+  addEmployee(data: { name: string; email: string; team: string; designation: string; password?: string }): Observable<Employee> {
     const cleanName = data.name.trim();
     const cleanEmail = data.email.trim().toLowerCase();
     const firstWord = cleanName ? cleanName.split(' ')[0].toLowerCase() : 'name';
     const cleanPwd = (data.password && data.password.trim()) ? data.password.trim() : `${firstWord}@1234`;
 
-    const newEmp: Employee = {
-      id: newId,
+    return this.http.post<Employee>(`${API_BASE_URL}/reference/employees`, {
       name: cleanName,
       email: cleanEmail,
       team: data.team,
-      designation: data.designation.trim()
-    };
-
-    this.state.update(s => ({
-      ...s,
-      employees: [...s.employees.filter(e => (e.email || '').toLowerCase() !== (newEmp.email || '').toLowerCase()), newEmp]
-    }));
-
-    this.http.post<any>(`${API_BASE_URL}/reference/employees`, {
-      name: newEmp.name,
-      email: newEmp.email,
-      team: newEmp.team,
-      designation: newEmp.designation,
+      designation: data.designation.trim(),
       password: cleanPwd
-    }).subscribe({
-      next: () => {
+    }).pipe(
+      tap((persistedEmp) => {
+        // ONLY once verified and stored in SQL Server database, update the UI state
+        this.state.update(s => ({
+          ...s,
+          employees: [...s.employees.filter(e => (e.email || '').toLowerCase() !== (persistedEmp.email || '').toLowerCase()), persistedEmp]
+        }));
         this.loadEmployeesFromBackend();
-      },
-      error: (err) => {
-        console.warn('Backend add employee error:', err);
-      }
-    });
-
-    return newEmp;
+      })
+    );
   }
 
   resetDemo(): void {

@@ -476,28 +476,34 @@ export class AddEmployeeComponent implements OnInit {
 
     const effectivePassword = this.password.trim() || this.computedDefaultPassword();
 
-    const newEmp = this.dataService.addEmployee({
+    this.dataService.addEmployee({
       name: this.name.trim(),
       email: this.email.trim().toLowerCase(),
       team: this.team,
       designation: this.designation.trim(),
       password: effectivePassword
+    }).subscribe({
+      next: (newEmp) => {
+        this.isSubmitting = false;
+        this.successMessage = `Account created for ${newEmp.name} (ID: ${newEmp.id}). Login Email: ${newEmp.email} | Password: ${effectivePassword}`;
+
+        // Reset Form
+        this.name = '';
+        this.email = '';
+        this.team = this.availableTeams()[0] || 'Frontend';
+        this.designation = 'Developer';
+        this.password = 'name@1234';
+        this.userCustomizedPassword = false;
+        this.touchedName = false;
+        this.touchedEmail = false;
+        this.touchedTeam = false;
+        this.touchedDesignation = false;
+        this.touchedPassword = false;
+      },
+      error: (err) => {
+        this.isSubmitting = false;
+        this.errorMessage = err?.error?.detail || err?.message || 'Failed to create employee in database. Please verify inputs and try again.';
+      }
     });
-
-    this.isSubmitting = false;
-    this.successMessage = `Account created for ${newEmp.name} (ID: ${newEmp.id}). Login Email: ${newEmp.email} | Password: ${effectivePassword}`;
-
-    // Reset Form
-    this.name = '';
-    this.email = '';
-    this.team = this.availableTeams()[0] || 'Frontend';
-    this.designation = 'Developer';
-    this.password = 'name@1234';
-    this.userCustomizedPassword = false;
-    this.touchedName = false;
-    this.touchedEmail = false;
-    this.touchedTeam = false;
-    this.touchedDesignation = false;
-    this.touchedPassword = false;
   }
 }

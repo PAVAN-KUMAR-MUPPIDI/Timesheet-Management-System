@@ -602,6 +602,10 @@ class SQLServerRepository:
                     cur.execute("SELECT AiToolId FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
                     if not cur.fetchone():
                         cur.execute("INSERT INTO dbo.AiTools (ToolName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
+                elif category == 'teams':
+                    cur.execute("SELECT TeamId FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
+                    if not cur.fetchone():
+                        cur.execute("INSERT INTO dbo.Teams (TeamName, IsActive) VALUES (?, 1)", (val,))
         finally:
             conn.close()
 
@@ -645,7 +649,20 @@ class SQLServerRepository:
 
         try:
             cur = conn.cursor()
+            # 1. Delete from dbo.ControlledFields
             cur.execute("DELETE FROM dbo.ControlledFields WHERE Category=? AND LOWER(Value)=?", (category, val.lower()))
+
+            # 2. Delete from corresponding master table if applicable
+            if category == 'taskTypes':
+                cur.execute("DELETE FROM dbo.TaskTypes WHERE LOWER(TaskTypeName)=?", (val.lower(),))
+            elif category == 'aiTools':
+                cur.execute("DELETE FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
+            elif category == 'projects':
+                cur.execute("DELETE FROM dbo.Projects WHERE LOWER(ProjectName)=?", (val.lower(),))
+            elif category == 'modules':
+                cur.execute("DELETE FROM dbo.Modules WHERE LOWER(ModuleName)=?", (val.lower(),))
+            elif category == 'teams':
+                cur.execute("DELETE FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
         finally:
             conn.close()
 
