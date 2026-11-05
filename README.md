@@ -147,12 +147,7 @@ All authentication credentials are verified dynamically against `dbo.Users` in S
 
 | Role | Email | Password | Primary Dashboard |
 | :--- | :--- | :--- | :--- |
-| **Engineering Manager** | `mohan@company.com` | `mohan@1234` | `/manager/team-dashboard` |
-| **Employee (UX Design)** | `chandrika.t@company.com` | `chandrika@1234` | `/employee/dashboard` |
-| **Employee (Backend)** | `pavan.m@company.com` | `pavan@1234` | `/employee/dashboard` |
-| **Employee (Frontend)** | `raghu.d@company.com` | `raghu@1234` | `/employee/dashboard` |
-| **Employee (QA)** | `sushmitha.k@company.com` | `sushmitha@1234` | `/employee/dashboard` |
-
+| **Engineering Manager** | `name@company.com` | `name@1234` | `/manager/team-dashboard` |
 ---
 
 ## Key Features
