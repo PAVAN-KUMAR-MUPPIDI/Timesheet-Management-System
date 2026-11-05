@@ -459,8 +459,14 @@ export class ImportTimesheetsComponent {
       'Delete'
     ).subscribe(confirmed => {
       if (confirmed) {
-        this.dataService.deleteControlledField(category, value);
-        this.notification.toast(`Removed '${value}' from ${category} ✓`);
+        this.dataService.deleteControlledField(category, value).subscribe({
+          next: () => {
+            this.notification.toast(`Removed '${value}' from ${category} ✓`);
+          },
+          error: (err) => {
+            this.notification.toast(`Could not delete '${value}': ${err?.error?.detail || err?.message || 'Database error'}`, 3500);
+          }
+        });
       }
     });
   }

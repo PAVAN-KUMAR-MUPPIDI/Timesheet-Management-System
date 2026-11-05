@@ -20,13 +20,36 @@ def get_employees(team: str = "all", user: dict = Depends(get_current_user)):
 @router.post("/employees", status_code=status.HTTP_201_CREATED)
 def create_employee(req: EmployeeCreateReq, user: dict = Depends(require_manager)):
     """Only managers can create and add employees."""
-    return db.add_employee(
-        name=req.name,
-        email=req.email,
-        team=req.team,
-        designation=req.designation,
-        password=req.password
-    )
+    clean_name = req.name.strip()
+    clean_email = req.email.strip().lower()
+    clean_team = req.team.strip()
+    clean_desig = req.designation.strip()
+
+    if not clean_name or len(clean_name) < 2:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Full Name must be at least 2 characters.")
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A valid company email address is required.")
+    if not clean_team:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Assigned Team is required.")
+    if not clean_desig:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Designation is required.")
+
+    # Prevent duplicate accounts
+    existing_emp = next((e for e in db.employees if (e.get('email') or '').lower() == clean_email), None)
+    if existing_emp:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"An employee with email '{clean_email}' already exists.")
+
+    try:
+        created = db.add_employee(
+            name=clean_name,
+            email=clean_email,
+            team=clean_team,
+            designation=clean_desig,
+            password=req.password
+        )
+        return created
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create employee in database: {str(e)}")
 
 class ControlledFieldReq(BaseModel):
     category: str

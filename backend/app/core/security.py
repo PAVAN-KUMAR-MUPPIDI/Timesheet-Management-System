@@ -37,16 +37,30 @@ CSRF_PROTECTION = os.getenv("CSRF_PROTECTION", "true").strip().lower() in ("true
 CSRF_COOKIE_NAME = os.getenv("CSRF_COOKIE_NAME", "csrf_token")
 CSRF_HEADER_NAME = os.getenv("CSRF_HEADER_NAME", "X-CSRF-Token")
 
+import bcrypt
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    if not plain_password or not hashed_password:
+        return False
+    if plain_password == hashed_password:
+        return True
+    try:
+        raw_plain = plain_password.encode("utf-8")[:72]
+        raw_hash = hashed_password.encode("utf-8")
+        if bcrypt.checkpw(raw_plain, raw_hash):
+            return True
+    except Exception:
+        pass
     try:
         return pwd_context.verify(plain_password, hashed_password)
     except Exception:
         return False
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    raw = (password or "").encode("utf-8")[:72]
+    return bcrypt.hashpw(raw, bcrypt.gensalt()).decode("utf-8")
 
 def generate_csrf_token() -> str:
     """Generate a cryptographically secure random token for CSRF protection."""
