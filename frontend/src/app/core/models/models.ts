@@ -37,12 +37,12 @@ export interface TimesheetEntry {
   module?: string;
   taskType: string;
   details: string;
-  priority: 'Low' | 'Medium' | 'High' | 'Critical';
+  priority: string;
   planned: number;
   actual: number;
   aiHours: number;
   tool: string;
-  status: 'Not Started' | 'In Progress' | 'Completed' | 'On Hold' | 'Blocked';
+  status: string;
   notes?: string;
   state: EntryState;
   submittedAt?: string;
