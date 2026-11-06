@@ -21,7 +21,15 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 class SQLServerRepository:
     """
     Production repository layer backed by Microsoft SQL Server (TeamProductivityHub).
-    Handles dynamic querying, inserts, updates, and deletes directly against the database.
+    Fully normalized 3NF relational schema:
+    - dbo.Roles
+    - dbo.Teams
+    - dbo.Users (Unified managers & employees with RoleId, TeamId, ManagerId)
+    - dbo.TaskTypes
+    - dbo.AiTools
+    - dbo.Priorities
+    - dbo.TaskStatuses
+    - dbo.TimesheetEntries (Strictly normalized, referencing foreign keys without redundant columns)
     """
     def __init__(self):
         self.users: List[Dict[str, Any]] = []
@@ -62,12 +70,17 @@ class SQLServerRepository:
         try:
             cur = conn.cursor()
 
-            # 1. Load Users
+            # 1. Load Users (joining Roles and Teams for human-readable labels)
             cur.execute("""
-                SELECT UserId, Username, Email, PasswordHash, PlainPasswordHint, Role, Name, Designation, EmployeeId, IsActive
-                FROM dbo.Users
-                WHERE IsActive = 1
-                ORDER BY UserId
+                SELECT 
+                    u.UserId, u.Username, u.Email, u.PasswordHash, u.PlainPasswordHint,
+                    LOWER(r.RoleName) AS RoleName, u.Name, u.Designation, u.EmployeeId, u.IsActive,
+                    COALESCE(t.TeamName, 'Frontend') AS TeamName, u.TeamId, u.ManagerId
+                FROM dbo.Users u
+                JOIN dbo.Roles r ON u.RoleId = r.RoleId
+                LEFT JOIN dbo.Teams t ON u.TeamId = t.TeamId
+                WHERE u.IsActive = 1
+                ORDER BY u.UserId
             """)
             users_list = []
             for r in cur.fetchall():
@@ -81,30 +94,28 @@ class SQLServerRepository:
                     "name": r[6] or "",
                     "designation": r[7] or "",
                     "employeeId": r[8],
-                    "isActive": bool(r[9])
+                    "isActive": bool(r[9]),
+                    "team": r[10] or "",
+                    "teamId": r[11],
+                    "managerId": r[12]
                 })
             self.users = users_list
 
-            # 2. Load Employees
-            cur.execute("""
-                SELECT EmployeeId, Name, Email, TeamName, Designation, ManagerId, IsActive
-                FROM dbo.Employees
-                WHERE IsActive = 1
-                ORDER BY EmployeeId
-            """)
-            emp_list = []
-            for r in cur.fetchall():
-                emp_list.append({
-                    "id": r[0],
-                    "name": r[1] or "",
-                    "email": r[2] or "",
-                    "team": r[3] or "",
-                    "designation": r[4] or "",
-                    "managerId": r[5]
-                })
-            self.employees = emp_list
+            # 2. Derive Employees from dbo.Users (where Role is Employee or EmployeeId starts with E)
+            self.employees = [
+                {
+                    "id": u["employeeId"],
+                    "name": u["name"],
+                    "email": u["email"],
+                    "team": u["team"],
+                    "designation": u["designation"],
+                    "managerId": u.get("managerId") or "M01"
+                }
+                for u in self.users
+                if (u.get("role") == "employee" or (u.get("employeeId") and u["employeeId"].startswith("E"))) and u.get("employeeId")
+            ]
 
-            # 3. Load Reference Data & Controlled Fields
+            # 3. Load Dedicated Reference Data
             ref_data: Dict[str, Any] = {
                 'taskTypes': [],
                 'priorities': [],
@@ -115,47 +126,52 @@ class SQLServerRepository:
                 'teams': []
             }
 
-            cur.execute("SELECT Category, Value, Status FROM dbo.ControlledFields ORDER BY ControlledFieldId")
-            for r in cur.fetchall():
-                cat = r[0]
-                val = r[1]
-                stat = r[2]
-                if cat in ('projects', 'modules', 'teams'):
-                    if cat not in ref_data:
-                        ref_data[cat] = []
-                    ref_data[cat].append(val)
-                else:
-                    if cat not in ref_data:
-                        ref_data[cat] = []
-                    ref_data[cat].append({'name': val, 'status': stat})
+            # TaskTypes
+            cur.execute("SELECT TaskTypeName, Status FROM dbo.TaskTypes ORDER BY TaskTypeId")
+            ref_data['taskTypes'] = [{'name': r[0], 'status': r[1]} for r in cur.fetchall()]
 
-            # Augment projects, modules, teams from their master tables
-            cur.execute("SELECT ProjectName FROM dbo.Projects WHERE IsActive = 1 ORDER BY ProjectName")
-            db_projects = [r[0] for r in cur.fetchall()]
-            if db_projects:
-                ref_data['projects'] = list(dict.fromkeys(db_projects + ref_data.get('projects', [])))
+            # AiTools
+            cur.execute("SELECT ToolName, Status FROM dbo.AiTools ORDER BY AiToolId")
+            ref_data['aiTools'] = [{'name': r[0], 'status': r[1]} for r in cur.fetchall()]
 
-            cur.execute("SELECT ModuleName FROM dbo.Modules WHERE IsActive = 1 ORDER BY ModuleName")
-            db_modules = [r[0] for r in cur.fetchall()]
-            if db_modules:
-                ref_data['modules'] = list(dict.fromkeys(db_modules + ref_data.get('modules', [])))
+            # Priorities
+            cur.execute("SELECT PriorityName, Status FROM dbo.Priorities ORDER BY PriorityId")
+            ref_data['priorities'] = [{'name': r[0], 'status': r[1]} for r in cur.fetchall()]
 
-            cur.execute("SELECT TeamName FROM dbo.Teams WHERE IsActive = 1 ORDER BY TeamName")
-            db_teams = [r[0] for r in cur.fetchall()]
-            if db_teams:
-                ref_data['teams'] = list(dict.fromkeys(db_teams + ref_data.get('teams', [])))
+            # TaskStatuses
+            cur.execute("SELECT StatusName, Status FROM dbo.TaskStatuses ORDER BY TaskStatusId")
+            ref_data['statuses'] = [{'name': r[0], 'status': r[1]} for r in cur.fetchall()]
+
+            # Teams
+            cur.execute("SELECT TeamName, CASE WHEN IsActive=1 THEN 'Active' ELSE 'Inactive' END FROM dbo.Teams ORDER BY TeamId")
+            ref_data['teams'] = [r[0] for r in cur.fetchall()]
+
+            # Projects (distinct from TimesheetEntries)
+            cur.execute("SELECT DISTINCT ProjectName FROM dbo.TimesheetEntries WHERE ProjectName IS NOT NULL AND ProjectName != '' ORDER BY ProjectName")
+            ref_data['projects'] = [r[0] for r in cur.fetchall()]
+
+            # Modules (distinct from TimesheetEntries)
+            cur.execute("SELECT DISTINCT ModuleName FROM dbo.TimesheetEntries WHERE ModuleName IS NOT NULL AND ModuleName != '' ORDER BY ModuleName")
+            ref_data['modules'] = [r[0] for r in cur.fetchall()]
 
             self.reference_data = ref_data
 
-            # 4. Load Timesheet Entries
+            # 4. Load Normalized Timesheet Entries (joining reference tables to resolve display names)
             cur.execute("""
                 SELECT 
-                    TimesheetId, EntryCode, EmployeeId, WorkDate, MonthKey, 
-                    ProjectName, ModuleName, TaskTypeName, TaskDetails, Priority, 
-                    TaskStatus, PlannedHours, ActualHours, AiHours, ManualHours, 
-                    AiToolName, Notes, EntryState, SubmittedAt, IsDuplicate, IsIncomplete
-                FROM dbo.TimesheetEntries
-                ORDER BY TimesheetId
+                    te.TimesheetId, te.EntryCode, te.EmployeeId, te.WorkDate, te.MonthKey, 
+                    te.ProjectName, te.ModuleName, te.TaskTypeId, COALESCE(tt.TaskTypeName, 'Other') AS TaskTypeName, te.TaskDetails, 
+                    te.PriorityId, COALESCE(p.PriorityName, 'Medium') AS PriorityName, 
+                    te.TaskStatusId, COALESCE(ts.StatusName, 'Completed') AS StatusName, 
+                    te.PlannedHours, te.ActualHours, te.AiHours, te.ManualHours, 
+                    te.AiToolId, COALESCE(at.ToolName, 'None') AS ToolName, 
+                    te.Notes, te.EntryState, te.SubmittedAt, te.IsDuplicate, te.IsIncomplete
+                FROM dbo.TimesheetEntries te
+                LEFT JOIN dbo.TaskTypes tt ON te.TaskTypeId = tt.TaskTypeId
+                LEFT JOIN dbo.Priorities p ON te.PriorityId = p.PriorityId
+                LEFT JOIN dbo.TaskStatuses ts ON te.TaskStatusId = ts.TaskStatusId
+                LEFT JOIN dbo.AiTools at ON te.AiToolId = at.AiToolId
+                ORDER BY te.TimesheetId
             """)
             entries_list = []
             nums = []
@@ -167,13 +183,13 @@ class SQLServerRepository:
                 wdate = r[3]
                 date_str = wdate.strftime("%Y-%m-%d") if isinstance(wdate, (date, datetime)) else str(wdate)
                 
-                sub_at = r[18]
+                sub_at = r[22]
                 sub_str = sub_at.strftime("%Y-%m-%dT%H:%M") if isinstance(sub_at, (date, datetime)) else (str(sub_at) if sub_at else "")
 
-                planned = float(r[11] or 0)
-                actual = float(r[12] or 0)
-                ai_hours = float(r[13] or 0)
-                manual = float(r[14]) if r[14] is not None else max(0.0, actual - ai_hours)
+                planned = float(r[14] or 0)
+                actual = float(r[15] or 0)
+                ai_hours = float(r[16] or 0)
+                manual = float(r[17]) if r[17] is not None else max(0.0, actual - ai_hours)
 
                 entry = {
                     "id": code,
@@ -182,23 +198,27 @@ class SQLServerRepository:
                     "month": r[4],
                     "project": r[5] or "",
                     "module": r[6] or "",
-                    "taskType": r[7] or "",
-                    "details": r[8] or "",
-                    "taskDetails": r[8] or "",
-                    "priority": r[9] or "Medium",
-                    "status": r[10] or "Completed",
+                    "taskType": r[8] or "Other",
+                    "taskTypeId": r[7],
+                    "details": r[9] or "",
+                    "taskDetails": r[9] or "",
+                    "priority": r[11] or "Medium",
+                    "priorityId": r[10],
+                    "status": r[13] or "Completed",
+                    "statusId": r[12],
                     "planned": planned,
                     "actual": actual,
                     "aiHours": ai_hours,
                     "manual": manual,
-                    "tool": r[15] or "N/A",
-                    "aiTool": r[15] or "N/A",
-                    "notes": r[16] or "",
-                    "state": r[17] or "Submitted",
+                    "tool": r[19] or "None",
+                    "aiTool": r[19] or "None",
+                    "aiToolId": r[18],
+                    "notes": r[20] or "",
+                    "state": r[21] or "Submitted",
                     "submittedAt": sub_str,
                     "createdAt": int(code[1:]) if code.startswith('T') and code[1:].isdigit() else 1,
-                    "_dup": bool(r[19]),
-                    "_inc": bool(r[20])
+                    "_dup": bool(r[23]),
+                    "_inc": bool(r[24])
                 }
                 entries_list.append(entry)
 
@@ -213,6 +233,22 @@ class SQLServerRepository:
 
     _load_seed_data = load_data
 
+    def _get_lookup_maps(self, cur) -> tuple:
+        """Helper to get name-to-id lookup maps for foreign keys."""
+        cur.execute("SELECT TaskTypeId, TaskTypeName FROM dbo.TaskTypes")
+        tt_map = {row[1].strip().lower(): row[0] for row in cur.fetchall()}
+
+        cur.execute("SELECT PriorityId, PriorityName FROM dbo.Priorities")
+        p_map = {row[1].strip().lower(): row[0] for row in cur.fetchall()}
+
+        cur.execute("SELECT TaskStatusId, StatusName FROM dbo.TaskStatuses")
+        s_map = {row[1].strip().lower(): row[0] for row in cur.fetchall()}
+
+        cur.execute("SELECT AiToolId, ToolName FROM dbo.AiTools")
+        at_map = {row[1].strip().lower(): row[0] for row in cur.fetchall()}
+
+        return tt_map, p_map, s_map, at_map
+
     def save_data(self):
         """Persists additions, modifications, and deletions in self.entries to SQL Server."""
         conn = self._get_connection()
@@ -222,13 +258,14 @@ class SQLServerRepository:
 
         try:
             cur = conn.cursor()
+            tt_map, p_map, s_map, at_map = self._get_lookup_maps(cur)
+
             current_ids = set(e['id'] for e in self.entries)
             persisted_ids = set(self._persisted_entries.keys())
 
             # 1. Handle Deletions
             deleted_ids = list(persisted_ids - current_ids)
             if deleted_ids:
-                # Batch delete in chunks of 500
                 chunk_size = 500
                 for i in range(0, len(deleted_ids), chunk_size):
                     chunk = deleted_ids[i:i + chunk_size]
@@ -244,12 +281,7 @@ class SQLServerRepository:
                 if not eid:
                     continue
                 
-                if "details" in e:
-                    task_details = str(e.get("details") or "")
-                elif "taskDetails" in e:
-                    task_details = str(e.get("taskDetails") or "")
-                else:
-                    task_details = ""
+                task_details = str(e.get("details") or e.get("taskDetails") or "")
                 e["details"] = task_details
                 e["taskDetails"] = task_details
                 
@@ -265,6 +297,19 @@ class SQLServerRepository:
                     except Exception:
                         sub_at_val = None
 
+                # Foreign Key Lookups
+                tt_name = str(e.get("taskType", "Other")).strip().lower()
+                tt_id = tt_map.get(tt_name, 16) # Default to 16: Other
+
+                p_name = str(e.get("priority", "Medium")).strip().lower()
+                p_id = p_map.get(p_name, 2) # Default to 2: Medium
+
+                s_name = str(e.get("status", "Completed")).strip().lower()
+                s_id = s_map.get(s_name, 3) # Default to 3: Completed
+
+                tool_name = str(e.get("aiTool", e.get("tool", "None"))).strip().lower()
+                at_id = at_map.get(tool_name, at_map.get("n/a", 14))
+
                 # Check if new
                 if eid not in self._persisted_entries:
                     insert_rows.append((
@@ -274,15 +319,15 @@ class SQLServerRepository:
                         e.get("month", str(e.get("date", "2026-10-01"))[:7]),
                         e.get("project", ""),
                         e.get("module", ""),
-                        e.get("taskType", "Development"),
+                        tt_id,
                         task_details,
-                        e.get("priority", "Medium"),
-                        e.get("status", "Completed"),
+                        p_id,
+                        s_id,
                         planned_val,
                         actual_val,
                         ai_hours_val,
                         manual_val,
-                        e.get("aiTool", e.get("tool", "N/A")),
+                        at_id,
                         e.get("notes", ""),
                         e.get("state", "Submitted"),
                         sub_at_val,
@@ -295,15 +340,15 @@ class SQLServerRepository:
                         e.get("month", str(e.get("date", "2026-10-01"))[:7]),
                         e.get("project", ""),
                         e.get("module", ""),
-                        e.get("taskType", "Development"),
+                        tt_id,
                         task_details,
-                        e.get("priority", "Medium"),
-                        e.get("status", "Completed"),
+                        p_id,
+                        s_id,
                         planned_val,
                         actual_val,
                         ai_hours_val,
                         manual_val,
-                        e.get("aiTool", e.get("tool", "N/A")),
+                        at_id,
                         e.get("notes", ""),
                         e.get("state", "Submitted"),
                         sub_at_val,
@@ -316,18 +361,18 @@ class SQLServerRepository:
                 cur.executemany("""
                     INSERT INTO dbo.TimesheetEntries (
                         EntryCode, EmployeeId, WorkDate, MonthKey, 
-                        ProjectName, ModuleName, TaskTypeName, TaskDetails, Priority, 
-                        TaskStatus, PlannedHours, ActualHours, AiHours, ManualHours, 
-                        AiToolName, Notes, EntryState, SubmittedAt, IsDuplicate, IsIncomplete
+                        ProjectName, ModuleName, TaskTypeId, TaskDetails, PriorityId, 
+                        TaskStatusId, PlannedHours, ActualHours, AiHours, ManualHours, 
+                        AiToolId, Notes, EntryState, SubmittedAt, IsDuplicate, IsIncomplete
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, insert_rows)
 
             if update_rows:
                 cur.executemany("""
                     UPDATE dbo.TimesheetEntries SET
-                        WorkDate=?, MonthKey=?, ProjectName=?, ModuleName=?, TaskTypeName=?,
-                        TaskDetails=?, Priority=?, TaskStatus=?, PlannedHours=?, ActualHours=?,
-                        AiHours=?, ManualHours=?, AiToolName=?, Notes=?, EntryState=?,
+                        WorkDate=?, MonthKey=?, ProjectName=?, ModuleName=?, TaskTypeId=?,
+                        TaskDetails=?, PriorityId=?, TaskStatusId=?, PlannedHours=?, ActualHours=?,
+                        AiHours=?, ManualHours=?, AiToolId=?, Notes=?, EntryState=?,
                         SubmittedAt=?, IsDuplicate=?, IsIncomplete=?, UpdatedAt=SYSUTCDATETIME()
                     WHERE EntryCode=?
                 """, update_rows)
@@ -359,7 +404,7 @@ class SQLServerRepository:
         designation: str,
         password: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Add or update an employee and their corresponding user login in SQL Server."""
+        """Add or update an employee user account in dbo.Users in SQL Server."""
         self.load_data()
         clean_email = email.strip().lower()
         clean_name = name.strip()
@@ -381,21 +426,21 @@ class SQLServerRepository:
             cur = conn.cursor()
 
             # Find TeamId
-            cur.execute("SELECT TeamId FROM dbo.Teams WHERE TeamName = ?", (clean_team,))
+            cur.execute("SELECT TeamId FROM dbo.Teams WHERE LOWER(TeamName) = ?", (clean_team.lower(),))
             t_row = cur.fetchone()
             team_id = t_row[0] if t_row else 1
 
-            # Check if employee exists
-            cur.execute("SELECT EmployeeId FROM dbo.Employees WHERE LOWER(Email) = ?", (clean_email,))
-            emp_row = cur.fetchone()
+            # Check if user already exists
+            cur.execute("SELECT UserId, EmployeeId FROM dbo.Users WHERE LOWER(Email) = ? OR LOWER(Username) = ?", (clean_email, username))
+            u_row = cur.fetchone()
 
-            if emp_row:
-                emp_id = emp_row[0]
+            if u_row:
+                emp_id = u_row[1]
                 cur.execute("""
-                    UPDATE dbo.Employees 
-                    SET Name=?, TeamId=?, TeamName=?, Designation=?, IsActive=1
-                    WHERE EmployeeId=?
-                """, (clean_name, team_id, clean_team, clean_desig, emp_id))
+                    UPDATE dbo.Users 
+                    SET Name=?, TeamId=?, Designation=?, PasswordHash=?, PlainPasswordHint=?, IsActive=1
+                    WHERE UserId=?
+                """, (clean_name, team_id, clean_desig, pwd_hash, clean_pwd, u_row[0]))
             else:
                 nums = [
                     int(e['id'][1:]) for e in self.employees
@@ -403,26 +448,13 @@ class SQLServerRepository:
                 ]
                 next_num = (max(nums) + 1) if nums else (len(self.employees) + 1)
                 emp_id = f"E{next_num:02d}"
-                cur.execute("""
-                    INSERT INTO dbo.Employees (EmployeeId, Name, Email, TeamId, TeamName, Designation, IsActive)
-                    VALUES (?, ?, ?, ?, ?, ?, 1)
-                """, (emp_id, clean_name, clean_email, team_id, clean_team, clean_desig))
 
-            # Upsert User
-            cur.execute("SELECT UserId FROM dbo.Users WHERE LOWER(Email) = ? OR LOWER(Username) = ?", (clean_email, username))
-            u_row = cur.fetchone()
-            if u_row:
-                user_id = u_row[0]
                 cur.execute("""
-                    UPDATE dbo.Users
-                    SET Name=?, Designation=?, EmployeeId=?, PasswordHash=?, PlainPasswordHint=?, IsActive=1
-                    WHERE UserId=?
-                """, (clean_name, clean_desig, emp_id, pwd_hash, clean_pwd, user_id))
-            else:
-                cur.execute("""
-                    INSERT INTO dbo.Users (Username, Email, PasswordHash, PlainPasswordHint, RoleId, Role, Name, Designation, EmployeeId, IsActive)
-                    VALUES (?, ?, ?, ?, 1, 'employee', ?, ?, ?, 1)
-                """, (username, clean_email, pwd_hash, clean_pwd, clean_name, clean_desig, emp_id))
+                    INSERT INTO dbo.Users (
+                        EmployeeId, Username, Email, PasswordHash, PlainPasswordHint, 
+                        RoleId, Name, TeamId, Designation, ManagerId, IsActive
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 'M01', 1)
+                """, (emp_id, username, clean_email, pwd_hash, clean_pwd, clean_name, team_id, clean_desig))
 
         finally:
             conn.close()
@@ -476,13 +508,6 @@ class SQLServerRepository:
                     WHERE UserId=?
                 """, (new_name, new_desig, user_id))
 
-            if user.get("employeeId"):
-                cur.execute("""
-                    UPDATE dbo.Employees
-                    SET Name=?, Designation=?
-                    WHERE EmployeeId=?
-                """, (new_name, new_desig, user["employeeId"]))
-
         finally:
             conn.close()
 
@@ -498,7 +523,7 @@ class SQLServerRepository:
             self.load_data()
 
         # Manager shortcuts
-        if target in ["manager", "mohan", "mohan@company.com"]:
+        if target in ["manager", "m01", "mohan", "mohan@company.com"]:
             mgr = next((u for u in self.users if u.get("role") == "manager"), None)
             if mgr:
                 return mgr
@@ -531,9 +556,14 @@ class SQLServerRepository:
             try:
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT UserId, Username, Email, PasswordHash, PlainPasswordHint, Role, Name, Designation, EmployeeId, IsActive
-                    FROM dbo.Users
-                    WHERE IsActive = 1 AND (LOWER(Email) = ? OR LOWER(Username) = ? OR LOWER(EmployeeId) = ?)
+                    SELECT 
+                        u.UserId, u.Username, u.Email, u.PasswordHash, u.PlainPasswordHint,
+                        LOWER(r.RoleName) AS RoleName, u.Name, u.Designation, u.EmployeeId, u.IsActive,
+                        COALESCE(t.TeamName, 'Frontend') AS TeamName, u.TeamId, u.ManagerId
+                    FROM dbo.Users u
+                    JOIN dbo.Roles r ON u.RoleId = r.RoleId
+                    LEFT JOIN dbo.Teams t ON u.TeamId = t.TeamId
+                    WHERE u.IsActive = 1 AND (LOWER(u.Email) = ? OR LOWER(u.Username) = ? OR LOWER(u.EmployeeId) = ?)
                 """, (target, target, target))
                 r = cur.fetchone()
                 if r:
@@ -547,7 +577,10 @@ class SQLServerRepository:
                         "name": r[6] or "",
                         "designation": r[7] or "",
                         "employeeId": r[8],
-                        "isActive": bool(r[9])
+                        "isActive": bool(r[9]),
+                        "team": r[10] or "",
+                        "teamId": r[11],
+                        "managerId": r[12]
                     }
             except Exception:
                 pass
@@ -579,33 +612,26 @@ class SQLServerRepository:
 
         try:
             cur = conn.cursor()
-            cur.execute("SELECT ControlledFieldId FROM dbo.ControlledFields WHERE Category=? AND LOWER(Value)=?", (category, val.lower()))
-            if not cur.fetchone():
-                cur.execute("""
-                    INSERT INTO dbo.ControlledFields (Category, Value, Status)
-                    VALUES (?, ?, ?)
-                """, (category, val, status))
-
-                if category == 'projects':
-                    cur.execute("SELECT ProjectId FROM dbo.Projects WHERE LOWER(ProjectName)=?", (val.lower(),))
-                    if not cur.fetchone():
-                        cur.execute("INSERT INTO dbo.Projects (ProjectName, IsActive) VALUES (?, 1)", (val,))
-                elif category == 'modules':
-                    cur.execute("SELECT ModuleId FROM dbo.Modules WHERE LOWER(ModuleName)=?", (val.lower(),))
-                    if not cur.fetchone():
-                        cur.execute("INSERT INTO dbo.Modules (ModuleName, IsActive) VALUES (?, 1)", (val,))
-                elif category == 'taskTypes':
-                    cur.execute("SELECT TaskTypeId FROM dbo.TaskTypes WHERE LOWER(TaskTypeName)=?", (val.lower(),))
-                    if not cur.fetchone():
-                        cur.execute("INSERT INTO dbo.TaskTypes (TaskTypeName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
-                elif category == 'aiTools':
-                    cur.execute("SELECT AiToolId FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
-                    if not cur.fetchone():
-                        cur.execute("INSERT INTO dbo.AiTools (ToolName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
-                elif category == 'teams':
-                    cur.execute("SELECT TeamId FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
-                    if not cur.fetchone():
-                        cur.execute("INSERT INTO dbo.Teams (TeamName, IsActive) VALUES (?, 1)", (val,))
+            if category == 'taskTypes':
+                cur.execute("SELECT TaskTypeId FROM dbo.TaskTypes WHERE LOWER(TaskTypeName)=?", (val.lower(),))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO dbo.TaskTypes (TaskTypeName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
+            elif category == 'aiTools':
+                cur.execute("SELECT AiToolId FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO dbo.AiTools (ToolName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
+            elif category == 'priorities':
+                cur.execute("SELECT PriorityId FROM dbo.Priorities WHERE LOWER(PriorityName)=?", (val.lower(),))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO dbo.Priorities (PriorityName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
+            elif category == 'statuses':
+                cur.execute("SELECT TaskStatusId FROM dbo.TaskStatuses WHERE LOWER(StatusName)=?", (val.lower(),))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO dbo.TaskStatuses (StatusName, Status, IsActive) VALUES (?, ?, 1)", (val, status))
+            elif category == 'teams':
+                cur.execute("SELECT TeamId FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO dbo.Teams (TeamName, IsActive) VALUES (?, 1)", (val,))
         finally:
             conn.close()
 
@@ -620,21 +646,36 @@ class SQLServerRepository:
 
         try:
             cur = conn.cursor()
-            cur.execute("SELECT Status FROM dbo.ControlledFields WHERE Category=? AND LOWER(Value)=?", (category, val.lower()))
-            row = cur.fetchone()
-            if row:
-                current_status = row[0]
-                new_status = target_status if target_status else ('Inactive' if current_status == 'Active' else 'Active')
-                cur.execute("""
-                    UPDATE dbo.ControlledFields
-                    SET Status=?
-                    WHERE Category=? AND LOWER(Value)=?
-                """, (new_status, category, val.lower()))
-
-                if category == 'taskTypes':
+            if category == 'taskTypes':
+                cur.execute("SELECT Status FROM dbo.TaskTypes WHERE LOWER(TaskTypeName)=?", (val.lower(),))
+                r = cur.fetchone()
+                if r:
+                    new_status = target_status if target_status else ('Inactive' if r[0] == 'Active' else 'Active')
                     cur.execute("UPDATE dbo.TaskTypes SET Status=? WHERE LOWER(TaskTypeName)=?", (new_status, val.lower()))
-                elif category == 'aiTools':
+            elif category == 'aiTools':
+                cur.execute("SELECT Status FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
+                r = cur.fetchone()
+                if r:
+                    new_status = target_status if target_status else ('Inactive' if r[0] == 'Active' else 'Active')
                     cur.execute("UPDATE dbo.AiTools SET Status=? WHERE LOWER(ToolName)=?", (new_status, val.lower()))
+            elif category == 'priorities':
+                cur.execute("SELECT Status FROM dbo.Priorities WHERE LOWER(PriorityName)=?", (val.lower(),))
+                r = cur.fetchone()
+                if r:
+                    new_status = target_status if target_status else ('Inactive' if r[0] == 'Active' else 'Active')
+                    cur.execute("UPDATE dbo.Priorities SET Status=? WHERE LOWER(PriorityName)=?", (new_status, val.lower()))
+            elif category == 'statuses':
+                cur.execute("SELECT Status FROM dbo.TaskStatuses WHERE LOWER(StatusName)=?", (val.lower(),))
+                r = cur.fetchone()
+                if r:
+                    new_status = target_status if target_status else ('Inactive' if r[0] == 'Active' else 'Active')
+                    cur.execute("UPDATE dbo.TaskStatuses SET Status=? WHERE LOWER(StatusName)=?", (new_status, val.lower()))
+            elif category == 'teams':
+                cur.execute("SELECT IsActive FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
+                r = cur.fetchone()
+                if r:
+                    new_act = 0 if r[0] else 1
+                    cur.execute("UPDATE dbo.Teams SET IsActive=? WHERE LOWER(TeamName)=?", (new_act, val.lower()))
         finally:
             conn.close()
 
@@ -649,20 +690,31 @@ class SQLServerRepository:
 
         try:
             cur = conn.cursor()
-            # 1. Delete from dbo.ControlledFields
-            cur.execute("DELETE FROM dbo.ControlledFields WHERE Category=? AND LOWER(Value)=?", (category, val.lower()))
-
-            # 2. Delete from corresponding master table if applicable
             if category == 'taskTypes':
-                cur.execute("DELETE FROM dbo.TaskTypes WHERE LOWER(TaskTypeName)=?", (val.lower(),))
+                try:
+                    cur.execute("DELETE FROM dbo.TaskTypes WHERE LOWER(TaskTypeName)=?", (val.lower(),))
+                except pyodbc.IntegrityError:
+                    cur.execute("UPDATE dbo.TaskTypes SET IsActive=0, Status='Inactive' WHERE LOWER(TaskTypeName)=?", (val.lower(),))
             elif category == 'aiTools':
-                cur.execute("DELETE FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
-            elif category == 'projects':
-                cur.execute("DELETE FROM dbo.Projects WHERE LOWER(ProjectName)=?", (val.lower(),))
-            elif category == 'modules':
-                cur.execute("DELETE FROM dbo.Modules WHERE LOWER(ModuleName)=?", (val.lower(),))
+                try:
+                    cur.execute("DELETE FROM dbo.AiTools WHERE LOWER(ToolName)=?", (val.lower(),))
+                except pyodbc.IntegrityError:
+                    cur.execute("UPDATE dbo.AiTools SET IsActive=0, Status='Inactive' WHERE LOWER(ToolName)=?", (val.lower(),))
+            elif category == 'priorities':
+                try:
+                    cur.execute("DELETE FROM dbo.Priorities WHERE LOWER(PriorityName)=?", (val.lower(),))
+                except pyodbc.IntegrityError:
+                    cur.execute("UPDATE dbo.Priorities SET IsActive=0, Status='Inactive' WHERE LOWER(PriorityName)=?", (val.lower(),))
+            elif category == 'statuses':
+                try:
+                    cur.execute("DELETE FROM dbo.TaskStatuses WHERE LOWER(StatusName)=?", (val.lower(),))
+                except pyodbc.IntegrityError:
+                    cur.execute("UPDATE dbo.TaskStatuses SET IsActive=0, Status='Inactive' WHERE LOWER(StatusName)=?", (val.lower(),))
             elif category == 'teams':
-                cur.execute("DELETE FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
+                try:
+                    cur.execute("DELETE FROM dbo.Teams WHERE LOWER(TeamName)=?", (val.lower(),))
+                except pyodbc.IntegrityError:
+                    cur.execute("UPDATE dbo.Teams SET IsActive=0 WHERE LOWER(TeamName)=?", (val.lower(),))
         finally:
             conn.close()
 
